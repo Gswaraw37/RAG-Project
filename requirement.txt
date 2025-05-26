@@ -1,0 +1,15 @@
+streamlit
+python-dotenv
+langchain
+langchain-core
+langchain-community
+docx2txt
+pypdf
+langchain-chroma
+sentence-transformers
+transformers
+accelerate
+llama-cpp-python
+mysql-connector-python
+huggingface_hub
+werkzeug

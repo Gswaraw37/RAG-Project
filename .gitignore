@@ -1,0 +1,9 @@
+.env
+.env.old
+venv/
+__pycache__/
+.dist/
+
+model/
+chroma_db/
+base_knowledge/
