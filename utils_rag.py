@@ -1,389 +1,464 @@
 import os
-import streamlit as st # Menggunakan st untuk caching Streamlit
+import re
+import streamlit as st
 from dotenv import load_dotenv
-from huggingface_hub import hf_hub_download, login
+
 from langchain_community.llms import LlamaCpp
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.output_parsers import StrOutputParser
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings.sentence_transformer import SentenceTransformerEmbeddings
 from langchain_chroma import Chroma
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.output_parsers import StrOutputParser
-# from langchain.schema.runnable import RunnablePassthrough # Diganti dengan langchain_core.runnables
-from langchain_core.runnables import RunnablePassthrough
-from langchain.chains import create_history_aware_retriever, create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
-# from langchain_core.documents import Document # Tidak secara eksplisit digunakan di sini tapi baik untuk diketahui
+from langchain.schema.runnable import RunnablePassthrough, RunnableLambda
+from langchain_core.messages import HumanMessage, AIMessage
+from huggingface_hub import login, hf_hub_download
 
-import utils_db # Untuk mendapatkan file basis pengetahuan aktif
+import utils_db
 
-# Muat variabel lingkungan dari file .env
 load_dotenv(override=True)
 
+llm = None
+embedding_function = None
+vectorstore = None
+retriever = None
+contextualize_q_chain = None
+answer_generation_chain = None
+
+MAX_HISTORY_MESSAGES_FOR_CONTEXTUALIZATION = int(os.getenv("MAX_HISTORY_MESSAGES_FOR_CONTEXTUALIZATION", 4))
+MAX_STANDALONE_QUESTION_WORDS = int(os.getenv("MAX_STANDALONE_QUESTION_WORDS", 30))
+MIN_VALID_ANSWER_LENGTH = int(os.getenv("MIN_VALID_ANSWER_LENGTH", 15))
+MIN_CONTEXT_LENGTH_FOR_ANSWER = int(os.getenv("MIN_CONTEXT_LENGTH_FOR_ANSWER", 50))
+MIN_KEYWORD_OVERLAP_FOR_RELEVANCE = int(os.getenv("MIN_KEYWORD_OVERLAP_FOR_RELEVANCE", 1))
+
+LLM_MODEL_PATH = os.getenv("LLM_MODEL_PATH")
+EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "intfloat/multilingual-e5-large")
+CHROMA_PERSIST_DIRECTORY = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db_streamlit_app")
+COLLECTION_NAME = os.getenv("CHROMA_COLLECTION_NAME", "giziai_knowledge_app")
+HF_TOKEN = os.getenv("HF_TOKEN")
+KNOWLEDGE_BASE_DIR = os.getenv("UPLOAD_FOLDER", "base_knowledge")
+
 # Pastikan direktori yang diperlukan ada
-os.makedirs("model", exist_ok=True)
-os.makedirs("chroma_db", exist_ok=True)
-os.makedirs("base_knowledge", exist_ok=True)
+# Pindahkan pembuatan direktori model ke dalam load_llm_model jika path model ada
+# if LLM_MODEL_PATH and not os.path.exists(os.path.dirname(LLM_MODEL_PATH)) and os.path.dirname(LLM_MODEL_PATH) != "":
+#     os.makedirs(os.path.dirname(LLM_MODEL_PATH), exist_ok=True)
+os.makedirs(CHROMA_PERSIST_DIRECTORY, exist_ok=True)
+os.makedirs(KNOWLEDGE_BASE_DIR, exist_ok=True)
+# Untuk MODEL_CACHE_DIR dari .env Anda (misal "model/"), pastikan dibuat sebelum hf_hub_download jika digunakan
+MODEL_CACHE_DIR_FROM_ENV = os.getenv("MODEL_CACHE_DIR", "model/") # Ambil dari .env
+os.makedirs(MODEL_CACHE_DIR_FROM_ENV, exist_ok=True)
 
-# Login ke Hugging Face jika token ada di .env (opsional, tergantung model)
-if os.getenv("HF_TOKEN"):
-    login(token=os.getenv("HF_TOKEN"))
 
-# --- Pemuatan LLM ---
-@st.cache_resource # Cache resource LLM agar tidak dimuat ulang setiap saat
-def load_llm_model():
-    """Mengunduh (jika perlu) dan memuat model LlamaCpp."""
-    # Path lengkap ke model GGUF, hf_hub_download akan mengelola ini di dalam cache_dir
-    # hf_hub_download mengembalikan path absolut ke file yang diunduh.
-    try:
-        # hf_hub_download akan menyimpan file di MODEL_CACHE_DIR/nama_file jika tidak ada subfolder repo
-        # atau MODEL_CACHE_DIR/blobs/hash_file jika menggunakan cache default HF.
-        # Dengan cache_dir eksplisit, ia mencoba menempatkan langsung atau dalam struktur repo.
-        # Kita asumsikan model berada di MODEL_CACHE_DIR/MODEL_FILENAME setelah diunduh.
+def docs2str(docs):
+    return "\n\n".join(doc.page_content for doc in docs)
+
+def approximate_token_count(text):
+    if not text: return 0
+    return len(text) // 4
+
+def get_keywords_from_query(query_text):
+    if not query_text: return set()
+    words = re.sub(r'[^\w\s]', '', query_text.lower()).split()
+    keywords = {word for word in words if len(word) > 2}
+    return keywords
+
+@st.cache_resource(show_spinner="Menginisialisasi komponen inti RAG...")
+def initialize_rag_components():
+    global llm, embedding_function, vectorstore, retriever, contextualize_q_chain, answer_generation_chain
+
+    st.write("Memulai inisialisasi komponen RAG...")
+    all_components_initialized = True
+
+    # Login ke Hugging Face jika token ada (DIPINDAHKAN KE SINI)
+    if HF_TOKEN:
+        st.info("Mencoba login ke Hugging Face Hub dengan token yang disediakan...")
+        try:
+            login(token=HF_TOKEN)
+            st.success("Login ke Hugging Face Hub berhasil (jika token valid).")
+        except Exception as e:
+            st.warning(f"Gagal login ke Hugging Face Hub: {e}. Proses akan dilanjutkan.")
+
+    # 1. Inisialisasi LLM
+    if llm is None:
+        # Pastikan direktori untuk model LLM ada jika pathnya adalah path file
+        if LLM_MODEL_PATH and os.path.dirname(LLM_MODEL_PATH) and not os.path.exists(os.path.dirname(LLM_MODEL_PATH)):
+            os.makedirs(os.path.dirname(LLM_MODEL_PATH), exist_ok=True)
+            
+        if not LLM_MODEL_PATH:
+            st.error("Error: Path model LLM (LLM_MODEL_PATH) tidak dikonfigurasi di .env.")
+            all_components_initialized = False
+        elif not os.path.exists(LLM_MODEL_PATH):
+            # Logika unduh model jika LLM_MODEL_PATH tidak ada dan MODEL_REPO_ID didefinisikan
+            # Ini adalah contoh, sesuaikan dengan kebutuhan Anda jika ingin unduh otomatis
+            model_repo_id = os.getenv("MODEL_REPO_ID")
+            model_filename = os.getenv("MODEL_FILENAME")
+            model_cache_dir = os.getenv("MODEL_CACHE_DIR", "model/") # default ke "model/"
+
+            if model_repo_id and model_filename:
+                st.write(f"Model {model_filename} tidak ditemukan di {LLM_MODEL_PATH}. Mencoba mengunduh dari {model_repo_id} ke {model_cache_dir}...")
+                os.makedirs(model_cache_dir, exist_ok=True)
+                try:
+                    downloaded_model_path = hf_hub_download(
+                        repo_id=model_repo_id,
+                        filename=model_filename,
+                        cache_dir=model_cache_dir,
+                        local_dir=model_cache_dir, # Mencoba menyimpan langsung di sini
+                        local_dir_use_symlinks=False
+                    )
+                    # hf_hub_download mengembalikan path absolut ke file yang diunduh
+                    # Kita perlu memastikan LLM_MODEL_PATH sekarang menunjuk ke sana jika berhasil
+                    # Namun, untuk konsistensi, pengguna harus mengatur LLM_MODEL_PATH ke path yang benar setelah unduh.
+                    # Untuk sekarang, kita anggap jika LLM_MODEL_PATH tidak ada, itu error.
+                    # Atau, kita bisa update LLM_MODEL_PATH di sini jika unduhan berhasil, tapi itu jadi stateful.
+                    # Untuk kesederhanaan: jika LLM_MODEL_PATH tidak ada, maka error.
+                    st.error(f"Model LLM tidak ditemukan di path: '{LLM_MODEL_PATH}'. Harap unduh model secara manual atau pastikan MODEL_REPO_ID & MODEL_FILENAME di .env benar untuk unduhan otomatis (fitur unduh belum sepenuhnya diimplementasikan di sini).")
+                    all_components_initialized = False
+
+                except Exception as e:
+                    st.error(f"Error saat mencoba mengunduh model: {e}")
+                    all_components_initialized = False
+            else:
+                st.error(f"Error: File model LLM tidak ditemukan di path: '{LLM_MODEL_PATH}' dan konfigurasi untuk unduh otomatis (MODEL_REPO_ID, MODEL_FILENAME) tidak ada.")
+                all_components_initialized = False
         
-        # Cek apakah file model sudah ada secara manual terlebih dahulu
-        manual_model_path = os.path.join(os.getenv("MODEL_CACHE_DIR"), os.getenv("MODEL_FILENAME"))
-
-        if not os.path.exists(manual_model_path):
-            st.write(f"Model {os.getenv('MODEL_FILENAME')} tidak ditemukan di {manual_model_path}. Mencoba mengunduh...")
+        if all_components_initialized and os.path.exists(LLM_MODEL_PATH): # Hanya lanjut jika path valid
             try:
-                # hf_hub_download akan menyimpan file di dalam MODEL_CACHE_DIR
-                # dan mengembalikan path absolut ke file tersebut.
-                downloaded_model_path = hf_hub_download(
-                    repo_id=os.getenv("MODEL_REPO_ID"),
-                    filename=os.getenv("MODEL_FILENAME"),
-                    cache_dir=os.getenv("MODEL_CACHE_DIR"), # Menentukan direktori cache
-                    local_dir=os.getenv("MODEL_CACHE_DIR"), # Mencoba menyimpan langsung di sini
-                    local_dir_use_symlinks=False # Disarankan untuk cross-platform
+                st.write(f"Memuat LLM dari: {LLM_MODEL_PATH}")
+                llm = LlamaCpp(
+                    model_path=LLM_MODEL_PATH,
+                    n_gpu_layers=int(os.getenv("LLM_N_GPU_LAYERS", -1)), temperature=float(os.getenv("LLM_TEMPERATURE", 0.5)),
+                    top_p=float(os.getenv("LLM_TOP_P", 0.95)), repeat_penalty=float(os.getenv("LLM_REPEAT_PENALTY", 1.2)),
+                    stop=["Question:", "\n\n", "Human:"], max_tokens=int(os.getenv("LLM_MAX_TOKENS", 1024)),
+                    n_ctx=int(os.getenv("LLM_N_CTX", 8192)), n_batch=int(os.getenv("LLM_N_BATCH", 512)),
+                    verbose=False
                 )
-                # Pastikan path yang dikembalikan adalah yang kita gunakan
-                # Terkadang hf_hub_download membuat struktur folder tambahan.
-                # Jika downloaded_model_path adalah direktori, cari file di dalamnya.
-                if os.path.isdir(downloaded_model_path):
-                     potential_path = os.path.join(downloaded_model_path, os.getenv("MODEL_FILENAME"))
-                     if os.path.exists(potential_path):
-                         actual_model_path = potential_path
-                     else: # fallback jika struktur tidak terduga
-                         actual_model_path = manual_model_path # coba lagi path manual
-                else:
-                    actual_model_path = downloaded_model_path
-
-                if not os.path.exists(actual_model_path): # Jika masih tidak ditemukan
-                     st.error(f"Gagal mengunduh atau menemukan model di {actual_model_path} atau {manual_model_path}. Pastikan model ada atau dapat diunduh.")
-                     return None
+                st.success("LLM berhasil dimuat.")
             except Exception as e:
-                st.error(f"Error saat mengunduh model: {e}. Pastikan Anda memiliki koneksi internet dan token HF jika diperlukan.")
-                return None
-        else:
-            actual_model_path = manual_model_path
-            st.write(f"Model ditemukan di: {actual_model_path}")
+                st.error(f"Error saat memuat LLM LlamaCpp: {e}")
+                llm = None
+                all_components_initialized = False
+    else:
+        st.info("LLM sudah terinisialisasi sebelumnya.")
 
-
-        st.write(f"Memuat LLM dari: {actual_model_path}")
-        llm = LlamaCpp(
-            model_path=actual_model_path,
-            n_gpu_layers=-1, # Sesuai PDF, -1 untuk menggunakan semua layer GPU jika ada, atau 1
-            temperature=0.5, # Sesuai PDF
-            top_p=0.95, # Sesuai PDF
-            repeat_penalty=1.2, # Sesuai PDF
-            stop=["Question:", "\n\n", "Human:"], # Sesuai PDF
-            max_tokens=1024, # PDF: 1624, bisa disesuaikan
-            n_ctx=8192, # PDF: 8192, sesuaikan dengan kemampuan model dan memori. Peringatan di PDF: n_ctx_per_seq < n_ctx_train
-            n_batch=512, # Sesuai PDF
-            verbose=False, # Sesuai PDF
-            # f16_kv=True # Opsional, tergantung model dan hardware
-        )
-        st.success("LLM berhasil dimuat.")
-        return llm
-    except Exception as e:
-        st.error(f"Error memuat model LlamaCpp: {e}")
-        return None
-
-# --- Fungsi Embedding ---
-@st.cache_resource # Cache resource embedding model
-def get_embedding_function():
-    """Memuat model embedding Sentence Transformer."""
-    try:
-        st.write(f"Memuat model embedding: {os.getenv('EMBEDDING_MODEL_NAME')}")
-        # model_kwargs={'device': 'cuda'} # Jika ingin menggunakan GPU untuk embedding
-        # encode_kwargs={'normalize_embeddings': True} # Tergantung model dan kebutuhan
-        embedding_func = SentenceTransformerEmbeddings(
-            model_name=os.getenv("EMBEDDING_MODEL_NAME")
-        )
-        st.success("Model embedding berhasil dimuat.")
-        return embedding_func
-    except Exception as e:
-        st.error(f"Error memuat model embedding: {e}")
-        return None
-
-# --- Pemrosesan Dokumen ---
-def load_and_split_documents(file_paths: list):
-    """Memuat dokumen dari path yang diberikan dan membaginya menjadi chunk."""
-    docs = []
-    for file_path in file_paths:
-        try:
-            if file_path.endswith(".pdf"):
-                loader = PyPDFLoader(file_path)
-            elif file_path.endswith(".docx"):
-                loader = Docx2txtLoader(file_path)
-            elif file_path.endswith(".txt"):
-                loader = TextLoader(file_path, encoding='utf-8') # Tambahkan TextLoader
-            else:
-                st.warning(f"Tipe file tidak didukung: {file_path}")
-                continue
-            docs.extend(loader.load())
-        except Exception as e:
-            st.error(f"Error memuat dokumen {file_path}: {e}")
-
-    if not docs:
-        return []
-
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000, # Sesuai PDF
-        chunk_overlap=300, # Sesuai PDF
-        length_function=len # Sesuai PDF
-    )
-    splits = text_splitter.split_documents(docs)
-    st.write(f"Memuat {len(docs)} dokumen, dibagi menjadi {len(splits)} chunk.")
-    return splits
-
-# --- Vector Store (ChromaDB) ---
-# Cache vector store bisa rumit jika perlu sering update.
-# Untuk aplikasi ini, kita akan memuatnya atau membuatnya ulang jika ada file baru.
-def get_vectorstore(documents_splits: list = None, embedding_function=None, force_recreate=False):
-    """Mendapatkan instance Chroma vector store. Membuat baru jika belum ada atau dipaksa."""
+    # 2. Inisialisasi Embedding Function
     if embedding_function is None:
-        embedding_function = get_embedding_function()
-        if embedding_function is None:
-            st.error("Tidak dapat mendapatkan vector store tanpa fungsi embedding.")
-            return None
-
-    # Cek apakah direktori persistensi ada dan tidak kosong
-    vectorstore_exists_on_disk = os.path.exists(os.getenv("CHROMA_PERSIST_DIR")) and len(os.listdir(os.getenv("CHROMA_PERSIST_DIR"))) > 0
-    
-    if not force_recreate and vectorstore_exists_on_disk and not documents_splits:
-        # Coba muat dari disk jika tidak ada dokumen baru dan tidak dipaksa buat ulang
-        st.write(f"Mencoba memuat vector store yang ada dari: {os.getenv('CHROMA_PERSIST_DIR')}")
         try:
+            st.write(f"Memuat model embedding: {EMBEDDING_MODEL_NAME}")
+            embedding_function = SentenceTransformerEmbeddings(model_name=EMBEDDING_MODEL_NAME)
+            st.success(f"Embedding function '{EMBEDDING_MODEL_NAME}' berhasil dimuat.")
+        except Exception as e:
+            st.error(f"Error saat memuat embedding function '{EMBEDDING_MODEL_NAME}': {e}")
+            embedding_function = None
+            all_components_initialized = False
+    else:
+        st.info("Embedding function sudah terinisialisasi sebelumnya.")
+
+    # 3. Inisialisasi Vector Store dan Retriever
+    if vectorstore is None and embedding_function:
+        try:
+            st.write(f"Menginisialisasi vector store dari: {CHROMA_PERSIST_DIRECTORY}")
             vectorstore = Chroma(
-                persist_directory=os.getenv("CHROMA_PERSIST_DIR"),
-                embedding_function=embedding_function,
-                collection_name=os.getenv("CHROMA_COLLECTION_NAME")
+                collection_name=COLLECTION_NAME,
+                persist_directory=CHROMA_PERSIST_DIRECTORY,
+                embedding_function=embedding_function
             )
-            # Verifikasi apakah koleksi ada dan berisi data
-            if vectorstore._collection.count() > 0:
-                st.success("Vector store berhasil dimuat dari disk.")
-                return vectorstore
-            else:
-                st.warning("Vector store ada di disk tapi koleksi kosong. Akan dibuat ulang jika ada dokumen.")
-                if not documents_splits: return None # Tidak bisa buat ulang tanpa dokumen
+            retriever = vectorstore.as_retriever(
+                search_type="mmr",
+                search_kwargs={'k': 5, 'fetch_k': 10, 'lambda_mult': 0.7}
+            )
+            st.success(f"Vector store dan retriever berhasil diinisialisasi.")
+            process_pending_documents_streamlit()
         except Exception as e:
-            st.warning(f"Gagal memuat vector store dari disk: {e}. Akan dibuat ulang jika ada dokumen.")
-            if not documents_splits: return None
-
-    if documents_splits:
-        # Buat vector store baru jika ada dokumen (atau jika gagal muat/dipaksa)
-        st.write(f"Membuat vector store baru dari {len(documents_splits)} chunk dokumen.")
+            st.error(f"Error saat menginisialisasi ChromaDB/Retriever: {e}")
+            vectorstore = None
+            retriever = None
+            all_components_initialized = False
+    elif embedding_function is None and vectorstore is None:
+        st.warning("Vector store/Retriever tidak dapat diinisialisasi karena embedding function gagal dimuat.")
+        all_components_initialized = False
+    elif vectorstore is not None and retriever is None and embedding_function : # Jika vectorstore ada tapi retriever belum
         try:
-            vectorstore = Chroma.from_documents(
-                documents=documents_splits,
-                embedding=embedding_function,
-                persist_directory=os.getenv("CHROMA_PERSIST_DIR"), # Menyimpan ke disk
-                collection_name=os.getenv("CHROMA_COLLECTION_NAME")
+            retriever = vectorstore.as_retriever(
+                search_type="mmr",
+                search_kwargs={'k': 5, 'fetch_k': 10, 'lambda_mult': 0.7}
             )
-            st.success(f"Vector store berhasil dibuat dan disimpan di: {os.getenv('CHROMA_PERSIST_DIR')}")
-            return vectorstore
+            st.info("Retriever berhasil dibuat dari vectorstore yang sudah ada.")
+            process_pending_documents_streamlit() # Proses juga jika retriever baru dibuat
         except Exception as e:
-            st.error(f"Error membuat vector store: {e}")
-            return None
-    else:
-        st.info("Tidak ada dokumen untuk membuat vector store, dan tidak ada vector store valid yang bisa dimuat.")
-        return None
+            st.error(f"Error membuat retriever dari vectorstore yang ada: {e}")
+            retriever = None
+            all_components_initialized = False
+    elif vectorstore is not None and retriever is not None:
+         st.info("Vector store dan retriever sudah terinisialisasi sebelumnya.")
+         if embedding_function: # Hanya proses jika embedding ada
+            process_pending_documents_streamlit()
 
-def add_documents_to_vectorstore(new_documents_splits: list, embedding_function=None):
-    """Menambahkan dokumen baru ke vector store yang sudah ada."""
-    if not new_documents_splits:
-        st.info("Tidak ada dokumen baru untuk ditambahkan.")
-        return False
 
-    if embedding_function is None:
-        embedding_function = get_embedding_function()
-        if embedding_function is None:
-            st.error("Tidak dapat menambahkan dokumen tanpa fungsi embedding.")
-            return False
-    
-    try:
-        # Muat vector store yang ada
-        vectorstore = Chroma(
-            persist_directory=os.getenv("CHROMA_PERSIST_DIR"),
-            embedding_function=embedding_function,
-            collection_name=os.getenv("CHROMA_COLLECTION_NAME")
+    # 4. Setup Chains
+    if llm and retriever and (contextualize_q_chain is None or answer_generation_chain is None) :
+        st.write("Membuat Langchain chains...")
+        contextualize_q_system_prompt = (
+            "Diberikan riwayat percakapan dan pertanyaan pengguna terbaru "
+            "yang mungkin merujuk pada konteks dalam riwayat percakapan, "
+            "formulasikan pertanyaan mandiri yang dapat dipahami "
+            "tanpa riwayat percakapan. JANGAN menjawab pertanyaan, "
+            "cukup formulasikan ulang jika diperlukan dan kembalikan apa adanya."
         )
-        vectorstore.add_documents(new_documents_splits)
-        st.success(f"Berhasil menambahkan {len(new_documents_splits)} chunk baru ke vector store.")
-        return True
-    except Exception as e:
-        st.error(f"Error menambahkan dokumen ke vector store: {e}")
-        return False
+        contextualize_q_prompt = ChatPromptTemplate.from_messages([
+            ("system", contextualize_q_system_prompt),
+            MessagesPlaceholder(variable_name="chat_history"),
+            ("human", "{input}")
+        ])
+        contextualize_q_chain = contextualize_q_prompt | llm | StrOutputParser()
+        st.info("Contextualization chain berhasil dibuat.")
 
-# --- RAG Chain (sesuai PDF untuk Conversational RAG) ---
-def get_conversational_rag_chain(_llm, _retriever):
-    """Membuat conversational RAG chain."""
-    if _llm is None or _retriever is None:
-        st.error("LLM atau Retriever tidak tersedia untuk membuat RAG chain.")
-        return None
+        qa_template_simple_text = """Kamu adalah asisten ahli di bidang gizi dan kesehatan masyarakat.
+PENTING: KELUARKAN KEMAMPUAN MAKSIMALMU untuk menjawab pertanyaan dengan natural dan terstruktur SESUAI KONTEKS yang diberikan.
+Jika jawabannya tidak ada didalam KONTEKS, HARUS balas dengan: Maaf, saya tidak memiliki informasi yang cukup untuk menjawab pertanyaan ini.
 
-    # Prompt untuk kontekstualisasi pertanyaan (dari PDF)
-    contextualize_q_system_prompt = (
-        "Diberikan riwayat percakapan dan pertanyaan pengguna terbaru "
-        "yang mungkin merujuk pada konteks dalam riwayat percakapan, "
-        "formulasikan pertanyaan mandiri yang dapat dipahami "
-        "tanpa riwayat percakapan. JANGAN menjawab pertanyaan, "
-        "cukup formulasikan ulang jika diperlukan dan kembalikan apa adanya."
-    )
-    contextualize_q_prompt = ChatPromptTemplate.from_messages([
-        ("system", contextualize_q_system_prompt),
-        MessagesPlaceholder("chat_history"),
-        ("human", "{input}")
-    ])
-
-    history_aware_retriever = create_history_aware_retriever(
-        _llm, _retriever, contextualize_q_prompt
-    )
-
-    # Prompt untuk menjawab pertanyaan dengan konteks (dari PDF, bagian RAG chain)
-    # "Kamu adalah asisten ahli di bidang gizi dan kesehatan masyarakat.
-    # PENTING: KELUARKAN KEMAMPUAN MAKSIMALMU untuk menjawab pertanyaan dengan natural dan terstruktur SESUAI KONTEKS yang diberikan.
-    # Jika jawabannya tidak tahu, balas dengan: Maaf, saya tidak memiliki informasi yang cukup untuk menjawab pertanyaan ini.
-    # Konteks: {context}
-    # Pertanyaan: {question}
-    # Jawaban:"
-    # Di PDF, ini digabungkan dengan MessagesPlaceholder untuk history.
-    
-    # QA Prompt untuk create_stuff_documents_chain (sesuai PDF untuk create_retrieval_chain)
-    # PDF menggunakan:
-    # qa_prompt = ChatPromptTemplate.from_messages([
-    #     ("system", "You are a helpful AI assistant. Use the following context to answer the user's question."),
-    #     ("system", "Context: {context}"), # Ini mungkin salah, context biasanya dari retriever, bukan system message lagi
-    #     MessagesPlaceholder(variable_name="chat_history"),
-    #     ("human", "{input}")
-    # ])
-    # Mari kita sesuaikan dengan prompt RAG yang lebih umum dan efektif:
-    qa_system_prompt = """Kamu adalah asisten ahli di bidang gizi dan kesehatan masyarakat.
-Gunakan potongan konteks berikut untuk menjawab pertanyaan pengguna.
-Jika kamu tidak tahu jawabannya, katakan saja bahwa kamu tidak tahu, jangan mencoba membuat jawaban.
-Jawablah dengan natural dan terstruktur.
 Konteks:
-{context}"""
-    qa_prompt = ChatPromptTemplate.from_messages([
-        ("system", qa_system_prompt),
-        MessagesPlaceholder(variable_name="chat_history"), # Untuk menjaga percakapan
-        ("human", "{input}"),
-    ])
+{context}
 
-    question_answer_chain = create_stuff_documents_chain(_llm, qa_prompt)
-    
-    rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
-    st.success("Conversational RAG chain berhasil dibuat.")
-    return rag_chain
+Pertanyaan:
+{question}
 
-# --- Inisialisasi Pipeline RAG ---
-def initialize_rag_pipeline(force_reload_vectorstore=False, new_file_paths_to_process=None):
-    """Menginisialisasi semua komponen RAG: LLM, Embeddings, Vector Store, Retriever, dan RAG Chain."""
-    
-    # 1. Muat LLM
-    if 'llm' not in st.session_state or st.session_state.llm is None:
-        with st.spinner("Memuat Model Bahasa Besar (LLM)... Ini mungkin butuh waktu."):
-            st.session_state.llm = load_llm_model()
-    if st.session_state.llm is None:
-        st.error("LLM gagal dimuat. Fungsi chatbot akan terbatas.")
-        return False
+Jawaban:"""
+        simple_qa_prompt_template = ChatPromptTemplate.from_template(qa_template_simple_text)
 
-    # 2. Muat Fungsi Embedding
-    if 'embedding_function' not in st.session_state or st.session_state.embedding_function is None:
-        with st.spinner("Memuat Model Embedding..."):
-            st.session_state.embedding_function = get_embedding_function()
-    if st.session_state.embedding_function is None:
-        st.error("Fungsi embedding gagal dimuat. Fungsi RAG akan terbatas.")
-        return False
-
-    # 3. Vector Store
-    # Jika ada file baru untuk diproses, kita perlu memperbarui/membuat ulang vector store
-    if new_file_paths_to_process:
-        st.write(f"Memproses file baru: {new_file_paths_to_process}")
-        with st.spinner("Memproses dokumen baru dan memperbarui vector store..."):
-            new_splits = load_and_split_documents(new_file_paths_to_process)
-            if new_splits:
-                # Opsi 1: Tambahkan ke vector store yang ada (jika sudah ada)
-                # Opsi 2: Buat ulang vector store dengan semua file aktif + file baru (lebih sederhana untuk implementasi awal)
-                # Untuk kesederhanaan, kita akan memuat semua file aktif dari DB dan membuat ulang.
-                all_active_files = utils_db.get_active_knowledge_files() # Ini sudah termasuk yang baru ditandai aktif
-                all_splits = load_and_split_documents(all_active_files)
-                st.session_state.vectorstore = get_vectorstore(
-                    documents_splits=all_splits,
-                    embedding_function=st.session_state.embedding_function,
-                    force_recreate=True # Paksa buat ulang karena ada file baru
-                )
-            else:
-                st.warning("Tidak ada chunk valid dari file baru untuk memperbarui vector store.")
-    elif force_reload_vectorstore or 'vectorstore' not in st.session_state or st.session_state.vectorstore is None:
-        # Pemuatan awal atau pemuatan ulang paksa
-        with st.spinner("Memuat/Membuat Vector Store dari basis pengetahuan..."):
-            active_kb_files = utils_db.get_active_knowledge_files()
-            if active_kb_files:
-                st.write(f"Memuat dokumen untuk vector store dari: {active_kb_files}")
-                splits = load_and_split_documents(active_kb_files)
-                st.session_state.vectorstore = get_vectorstore(
-                    documents_splits=splits,
-                    embedding_function=st.session_state.embedding_function,
-                    force_recreate=force_reload_vectorstore
-                )
-            else: # Tidak ada file di DB, coba muat dari disk jika ada
-                st.info("Tidak ada file basis pengetahuan aktif di DB. Mencoba memuat vector store dari disk jika ada.")
-                st.session_state.vectorstore = get_vectorstore(
-                    embedding_function=st.session_state.embedding_function,
-                    force_recreate=False # Jangan paksa jika tidak ada file, hanya coba muat
-                )
-
-    if 'vectorstore' not in st.session_state or st.session_state.vectorstore is None:
-        st.warning("Vector store tidak tersedia. RAG tidak akan berfungsi optimal.")
-        st.session_state.retriever = None
-        st.session_state.rag_chain = None
-        # return False # Jangan hentikan di sini, mungkin pengguna hanya ingin dashboard
-        return True # Anggap saja inisialisasi parsial, chatbot tidak akan jalan
-
-    # 4. Retriever (sesuai PDF)
-    # search_kwargs dari PDF: {"k": 10, "fetch_k": 20, "lambda_mult": 0.75}
-    # Di PDF lain: retriever.invoke("Berapa persentase bayi baru lahir yang mendapatkan Inisiasi Menyusu Dini (IMD) pada 2023?")
-    # retriever = vectorstore.as_retriever(search_type="mmr", search_kwargs={"k": 10, "fetch_k": 20, "lambda_mult": 0.75})
-    # Kita gunakan k yang lebih kecil untuk awal
-    try:
-        st.session_state.retriever = st.session_state.vectorstore.as_retriever(
-            search_type="mmr", # Sesuai PDF
-            search_kwargs={'k': 5, 'fetch_k': 10, 'lambda_mult': 0.7} # Bisa disesuaikan
+        answer_generation_chain = (
+            RunnablePassthrough.assign(context=(lambda x: x["question"]) | retriever | RunnableLambda(docs2str))
+            | simple_qa_prompt_template
+            | llm
+            | StrOutputParser()
         )
-        st.success("Retriever berhasil dibuat.")
-    except Exception as e:
-        st.error(f"Gagal membuat retriever: {e}")
-        st.session_state.retriever = None
-        st.session_state.rag_chain = None
-        return False
+        st.info("Answer generation chain (RAG sederhana) berhasil dibuat.")
+    elif not llm or not retriever:
+        st.warning("Chains tidak dapat dibuat karena LLM atau Retriever tidak terinisialisasi.")
+        all_components_initialized = False
+    elif contextualize_q_chain and answer_generation_chain:
+        st.info("Langchain chains sudah terinisialisasi sebelumnya.")
 
-
-    # 5. Conversational RAG Chain
-    if st.session_state.llm and st.session_state.retriever:
-         with st.spinner("Membuat RAG Chain..."):
-            st.session_state.rag_chain = get_conversational_rag_chain(
-                st.session_state.llm,
-                st.session_state.retriever
-            )
+    if all_components_initialized and llm and retriever and contextualize_q_chain and answer_generation_chain:
+        st.success("Semua komponen RAG berhasil diinisialisasi.")
     else:
-        st.session_state.rag_chain = None
+        st.error("Beberapa komponen RAG gagal diinisialisasi sepenuhnya. Periksa log di atas.")
+        all_components_initialized = False # Pastikan false jika ada yg gagal
+    
+    return all_components_initialized
 
+def process_document_to_vectorstore_streamlit(filepath, file_id):
+    global vectorstore, embedding_function
+    if not vectorstore or not embedding_function:
+        st.error("Error: Vectorstore atau embedding function belum terinisialisasi untuk memproses dokumen.")
+        print("Error: Vectorstore atau embedding function belum terinisialisasi untuk memproses dokumen.")
+        return False
+    try:
+        st.info(f"Memproses file: {os.path.basename(filepath)} (ID DB: {file_id})")
+        print(f"Memproses file: {filepath} (ID: {file_id})")
+        
+        if filepath.endswith(".pdf"):
+            loader = PyPDFLoader(filepath)
+        elif filepath.endswith(".docx"):
+            loader = Docx2txtLoader(filepath)
+        elif filepath.endswith(".txt"):
+            loader = TextLoader(filepath, encoding='utf-8')
+        else:
+            st.warning(f"Tipe file {os.path.basename(filepath)} tidak didukung.")
+            print(f"Tipe file tidak didukung: {filepath}")
+            utils_db.update_file_status(file_id, 'error')
+            return False
+            
+        documents = loader.load()
+        if not documents:
+            st.warning(f"Tidak ada konten yang dapat dimuat dari {os.path.basename(filepath)}.")
+            print(f"Tidak ada konten yang dapat dimuat dari {filepath}")
+            utils_db.update_file_status(file_id, 'error')
+            return False
 
-    if st.session_state.rag_chain:
-        st.sidebar.success("Pipeline RAG berhasil diinisialisasi!")
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=300, length_function=len)
+        splits = text_splitter.split_documents(documents)
+
+        if not splits:
+            st.warning(f"Tidak ada teks yang dapat diekstrak (setelah split) dari {os.path.basename(filepath)}")
+            print(f"Tidak ada teks yang dapat diekstrak dari {filepath}")
+            utils_db.update_file_status(file_id, 'error')
+            return False
+        
+        for split in splits:
+            split.metadata["source"] = os.path.basename(filepath)
+            split.metadata["file_id"] = str(file_id)
+
+        vectorstore.add_documents(splits)
+        st.success(f"Berhasil memproses dan menambahkan {len(splits)} chunk dari {os.path.basename(filepath)} ke vector store.")
+        print(f"Berhasil memproses dan menambahkan {len(splits)} chunk dari {filepath} ke vector store.")
+        utils_db.update_file_status(file_id, 'active')
         return True
-    else:
-        st.sidebar.error("Gagal menginisialisasi RAG chain.")
+    except Exception as e:
+        st.error(f"Error saat memproses dokumen {os.path.basename(filepath)}: {e}")
+        print(f"Error saat memproses dokumen {filepath}: {e}")
+        utils_db.update_file_status(file_id, 'error')
         return False
+
+def process_pending_documents_streamlit():
+    global vectorstore, embedding_function
+    if not vectorstore or not embedding_function:
+        st.warning("Vectorstore atau embedding function belum siap untuk memproses dokumen pending.")
+        print("Vectorstore atau embedding function belum siap untuk memproses dokumen pending.")
+        return
+
+    st.write("Mengecek dokumen yang belum diproses dari database...")
+    print("Mengecek dokumen yang belum diproses...")
+    unprocessed_files = utils_db.get_unprocessed_files_for_rag()
+    
+    if not unprocessed_files:
+        st.info("Tidak ada dokumen baru untuk diproses dari database.")
+        print("Tidak ada dokumen baru untuk diproses.")
+        return
+
+    processed_count = 0
+    for db_file_entry in unprocessed_files:
+        filepath = db_file_entry['filepath']
+        file_id = db_file_entry['id']
+        filename = db_file_entry['filename']
+
+        if os.path.exists(filepath):
+            st.write(f"Memulai pemrosesan untuk file: {filename} (ID DB: {file_id})")
+            if process_document_to_vectorstore_streamlit(filepath, file_id):
+                processed_count +=1
+        else:
+            st.error(f"File {filename} (path: {filepath}, ID DB: {file_id}) tidak ditemukan di sistem file.")
+            print(f"File {filepath} (ID: {file_id}) tidak ditemukan.")
+            utils_db.update_file_status(file_id, 'error')
+    
+    if processed_count > 0:
+        st.success(f"Selesai memproses {processed_count} dokumen yang tertunda.")
+    else:
+        st.info("Tidak ada dokumen yang berhasil diproses pada sesi ini (mungkin sudah diproses atau ada error).")
+    print("Selesai memproses dokumen yang tertunda.")
+
+def get_rag_response_streamlit(session_uuid: str, user_input: str):
+    global llm, contextualize_q_chain, answer_generation_chain, retriever
+
+    if not llm or not contextualize_q_chain or not answer_generation_chain or not retriever:
+        error_msg = "Sistem RAG belum siap sepenuhnya."
+        st.error(error_msg)
+        print(f"ERROR: {error_msg}")
+        utils_db.insert_chat_log(session_uuid, user_input, error_msg, "N/A - RAG System Error")
+        return error_msg
+
+    chat_history_for_contextualization = utils_db.get_chat_history_from_db(session_uuid)
+    
+    if len(chat_history_for_contextualization) > MAX_HISTORY_MESSAGES_FOR_CONTEXTUALIZATION:
+        start_index = len(chat_history_for_contextualization) - MAX_HISTORY_MESSAGES_FOR_CONTEXTUALIZATION
+        chat_history_for_contextualization = chat_history_for_contextualization[start_index:]
+    
+    generated_standalone_question = user_input
+    if chat_history_for_contextualization:
+        try:
+            # st.write(f"DEBUG (Streamlit): Input ke kontekstualisasi - History: {len(chat_history_for_contextualization)} pesan, Input: '{user_input}'")
+            print(f"DEBUG: Input ke contextualize_q_chain - History: {len(chat_history_for_contextualization)} pesan, Input: '{user_input}'")
+            raw_reformulated_question = contextualize_q_chain.invoke({
+                "chat_history": chat_history_for_contextualization,
+                "input": user_input
+            })
+            # st.write(f"DEBUG (Streamlit): Output mentah dari kontekstualisasi: '{raw_reformulated_question}'")
+            print(f"DEBUG: Output mentah dari contextualize_q_chain: '{raw_reformulated_question}'")
+
+            cleaned_question = raw_reformulated_question.strip()
+            prefixes_to_remove = ["ai:", "jawaban:", "output anda:", "output saya:", "pertanyaan:"]
+            for prefix in prefixes_to_remove:
+                if cleaned_question.lower().startswith(prefix):
+                    cleaned_question = cleaned_question[len(prefix):].strip()
+            
+            word_count = len(cleaned_question.split())
+            is_likely_answer = (
+                word_count > MAX_STANDALONE_QUESTION_WORDS or
+                (not cleaned_question.endswith("?") and user_input.lower() != cleaned_question.lower())
+            )
+
+            if is_likely_answer and cleaned_question.lower() != user_input.lower() :
+                # st.write(f"DEBUG (Streamlit): Output kontekstualisasi ('{cleaned_question}') tampak seperti jawaban/terlalu panjang. Menggunakan input asli.")
+                print(f"DEBUG: Output kontekstualisasi ('{cleaned_question}') tampak seperti jawaban/terlalu panjang. Menggunakan input asli.")
+                generated_standalone_question = user_input
+            else:
+                generated_standalone_question = cleaned_question
+            # st.write(f"DEBUG (Streamlit): Pertanyaan asli: '{user_input}', Pertanyaan standalone: '{generated_standalone_question}'")
+            print(f"DEBUG: Pertanyaan asli: '{user_input}', Pertanyaan standalone (setelah pembersihan): '{generated_standalone_question}'")
+        except Exception as e:
+            st.error(f"Error saat kontekstualisasi pertanyaan: {e}. Menggunakan input asli.")
+            print(f"Error saat kontekstualisasi pertanyaan: {e}. Menggunakan input asli.")
+            generated_standalone_question = user_input
+    else:
+        # st.write(f"DEBUG (Streamlit): Tidak ada histori, pertanyaan digunakan langsung: '{generated_standalone_question}'")
+        print(f"DEBUG: Tidak ada histori, pertanyaan digunakan langsung: '{generated_standalone_question}'")
+
+    standalone_question_for_rag = generated_standalone_question
+
+    retrieved_docs_str = ""
+    is_context_relevant_for_question = False
+    try:
+        docs = retriever.invoke(standalone_question_for_rag)
+        retrieved_docs_str = docs2str(docs).strip()
+        # st.write(f"DEBUG (Streamlit): Konteks diambil (Panjang: {len(retrieved_docs_str)} chars):\n---\n{retrieved_docs_str[:100]}...\n---")
+        print(f"DEBUG: Konteks yang diambil (Panjang: {len(retrieved_docs_str)}):\n---\n{retrieved_docs_str[:200]}...\n---")
+
+        if retrieved_docs_str and len(retrieved_docs_str) >= MIN_CONTEXT_LENGTH_FOR_ANSWER:
+            question_keywords = get_keywords_from_query(standalone_question_for_rag)
+            context_sample_for_keywords = retrieved_docs_str[:1000].lower()
+            common_keyword_count = 0
+            if question_keywords:
+                for q_keyword in question_keywords:
+                    if q_keyword in context_sample_for_keywords:
+                        common_keyword_count += 1
+            if common_keyword_count >= MIN_KEYWORD_OVERLAP_FOR_RELEVANCE:
+                is_context_relevant_for_question = True
+        # st.write(f"DEBUG (Streamlit): Apakah konteks relevan? {is_context_relevant_for_question}. Overlap kata kunci: {common_keyword_count if 'common_keyword_count' in locals() else 'N/A'}")
+        print(f"DEBUG: Apakah konteks relevan untuk pertanyaan ('{standalone_question_for_rag}')? {is_context_relevant_for_question}. Overlap kata kunci: {common_keyword_count if 'common_keyword_count' in locals() else 'N/A'}")
+    except Exception as e:
+        st.error(f"DEBUG: Error saat mengambil dokumen: {e}")
+        print(f"DEBUG: Error saat mengambil dokumen: {e}")
+        retrieved_docs_str = ""
+
+    fallback_message = "Maaf, saya tidak memiliki informasi yang cukup untuk menjawab pertanyaan ini."
+    bot_answer = fallback_message
+
+    try:
+        if not is_context_relevant_for_question and retrieved_docs_str:
+            # st.write("DEBUG (Streamlit): Konteks diambil tapi dianggap tidak relevan. Menggunakan fallback.")
+            print("DEBUG: Konteks diambil tapi dianggap tidak relevan. Menggunakan fallback.")
+            bot_answer = fallback_message
+        elif not retrieved_docs_str:
+            # st.write("DEBUG (Streamlit): Tidak ada konteks yang diambil. Menggunakan fallback.")
+            print("DEBUG: Tidak ada konteks yang diambil. Menggunakan fallback.")
+            bot_answer = fallback_message
+        else:
+            # st.write("DEBUG (Streamlit): Konteks relevan, melanjutkan ke LLM untuk jawaban.")
+            print("DEBUG: Konteks relevan, melanjutkan ke LLM untuk jawaban.")
+            bot_answer_raw = answer_generation_chain.invoke({
+                "question": standalone_question_for_rag,
+            })
+            # st.write(f"DEBUG (Streamlit): Output mentah dari LLM: '{bot_answer_raw}'")
+            print(f"DEBUG: Output mentah dari answer_generation_chain: '{bot_answer_raw}'")
+            bot_answer_stripped = bot_answer_raw.strip()
+
+            if not bot_answer_stripped or len(bot_answer_stripped) < MIN_VALID_ANSWER_LENGTH:
+                if fallback_message.lower() not in bot_answer_stripped.lower():
+                    # st.write(f"DEBUG (Streamlit) Post-Proc: Output LLM ('{bot_answer_stripped}') kosong/pendek. Fallback.")
+                    print(f"DEBUG Post-Proc: Output LLM ('{bot_answer_stripped}') kosong/pendek. Fallback.")
+                    bot_answer = fallback_message
+                else:
+                    bot_answer = bot_answer_stripped
+            else:
+                bot_answer = bot_answer_stripped
+    except Exception as e:
+        st.error(f"Error saat menjalankan answer generation chain: {e}")
+        print(f"Error saat menjalankan answer generation chain: {e}")
+        bot_answer = fallback_message
+        utils_db.insert_chat_log(session_uuid, user_input, f"Error: {str(e)} | Fallback: {bot_answer}",
+                                 os.path.basename(LLM_MODEL_PATH) if LLM_MODEL_PATH else "LlamaCpp_Unknown")
+        return bot_answer
+
+    model_name_for_log = os.path.basename(LLM_MODEL_PATH) if LLM_MODEL_PATH else "LlamaCpp_Unknown"
+    utils_db.insert_chat_log(session_uuid, user_input, bot_answer, model_name_for_log)
+    
+    return bot_answer

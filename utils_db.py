@@ -2,7 +2,9 @@ import mysql.connector
 import os
 from dotenv import load_dotenv
 from datetime import datetime
-from werkzeug.security import generate_password_hash, check_password_hash # Untuk hashing password
+# Gunakan metode hash yang lebih portabel jika 'scrypt' bermasalah di lingkungan deploy
+# from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.security import generate_password_hash, check_password_hash
 
 # Muat variabel lingkungan dari file .env
 load_dotenv(override=True)
@@ -13,29 +15,23 @@ DB_CONFIG = {
     "user": os.getenv("DB_USER"),
     "password": os.getenv("DB_PASSWORD"),
     "database": os.getenv("DB_NAME"),
-    "port": os.getenv("DB_PORT", "3306") # Default port 3306 jika tidak diset
+    "port": os.getenv("DB_PORT", "3306")
 }
 
 def get_db_connection():
-    """Membuat dan mengembalikan koneksi ke database MySQL."""
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
         return conn
     except mysql.connector.Error as err:
         print(f"Kesalahan koneksi ke MySQL: {err}")
-        # Dalam aplikasi Streamlit, Anda mungkin ingin menggunakan st.error()
         return None
 
 def create_tables():
-    """Membuat tabel yang diperlukan dalam database jika belum ada."""
     conn = get_db_connection()
     if not conn:
         print("Tidak dapat membuat tabel, tidak ada koneksi DB.")
         return
-    
     cursor = conn.cursor()
-
-    # Tabel pengguna (untuk admin)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INT AUTO_INCREMENT PRIMARY KEY,
@@ -45,19 +41,15 @@ def create_tables():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-
-    # Tabel untuk menyimpan metadata file basis pengetahuan
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS knowledge_files (
             id INT AUTO_INCREMENT PRIMARY KEY,
             filename VARCHAR(255) NOT NULL,
             filepath VARCHAR(512) NOT NULL,
             uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            status ENUM('active', 'processing', 'inactive', 'error') DEFAULT 'processing'
+            status ENUM('active', 'processing', 'inactive', 'error', 'pending') DEFAULT 'pending' 
         )
-    ''')
-
-    # Tabel untuk log chat (mirip application_logs di PDF)
+    ''') # Tambah status 'pending' jika mau
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS chat_logs (
             id INT AUTO_INCREMENT PRIMARY KEY,
@@ -75,41 +67,34 @@ def create_tables():
     print("Pengecekan/pembuatan tabel database selesai.")
 
 def add_admin_user_if_not_exists():
-    """Menambahkan pengguna admin default jika belum ada."""
     conn = get_db_connection()
     if not conn: return
-
     cursor = conn.cursor()
     admin_user = os.getenv("ADMIN_USERNAME", "admin")
-    admin_pass = os.getenv("ADMIN_PASSWORD", "admin_password") # Ambil password dari .env
-
+    admin_pass = os.getenv("ADMIN_PASSWORD", "admin_password")
     cursor.execute("SELECT id FROM users WHERE username = %s AND role = 'admin'", (admin_user,))
     if not cursor.fetchone():
         if not admin_pass:
             print("Password admin tidak diset di .env. Tidak dapat membuat admin.")
-            cursor.close()
-            conn.close()
-            return
-            
-        hashed_password = generate_password_hash(admin_pass)
-        try:
-            cursor.execute(
-                "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, %s)",
-                (admin_user, hashed_password, 'admin')
-            )
-            conn.commit()
-            print(f"Pengguna admin '{admin_user}' berhasil dibuat.")
-        except mysql.connector.Error as err:
-            print(f"Gagal membuat pengguna admin: {err}")
-            conn.rollback()
+        else:
+            # Menggunakan metode hash yang lebih portabel jika scrypt bermasalah
+            hashed_password = generate_password_hash(admin_pass, method='pbkdf2:sha256')
+            try:
+                cursor.execute(
+                    "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, %s)",
+                    (admin_user, hashed_password, 'admin')
+                )
+                conn.commit()
+                print(f"Pengguna admin '{admin_user}' berhasil dibuat dengan metode pbkdf2:sha256.")
+            except mysql.connector.Error as err:
+                print(f"Gagal membuat pengguna admin: {err}")
+                conn.rollback()
     cursor.close()
     conn.close()
 
 def verify_admin(username, password):
-    """Memverifikasi kredensial admin."""
     conn = get_db_connection()
     if not conn: return False
-    
     cursor = conn.cursor(dictionary=True)
     try:
         cursor.execute("SELECT password_hash, role FROM users WHERE username = %s", (username,))
@@ -123,11 +108,9 @@ def verify_admin(username, password):
         conn.close()
     return False
 
-def store_file_metadata(filename, filepath, status='processing'):
-    """Menyimpan metadata file yang diunggah ke database."""
+def store_file_metadata(filename, filepath, status='processing'): # Default status saat upload
     conn = get_db_connection()
     if not conn: return None
-    
     cursor = conn.cursor()
     query = "INSERT INTO knowledge_files (filename, filepath, status) VALUES (%s, %s, %s)"
     try:
@@ -144,27 +127,24 @@ def store_file_metadata(filename, filepath, status='processing'):
         conn.close()
 
 def update_file_status(file_id, status):
-    """Memperbarui status file dalam database."""
     conn = get_db_connection()
     if not conn: return
-    
     cursor = conn.cursor()
     query = "UPDATE knowledge_files SET status = %s WHERE id = %s"
     try:
         cursor.execute(query, (status, file_id))
         conn.commit()
+        print(f"Status file ID {file_id} diupdate menjadi {status}")
     except mysql.connector.Error as err:
-        print(f"Error memperbarui status file: {err}")
+        print(f"Error memperbarui status file ID {file_id}: {err}")
         conn.rollback()
     finally:
         cursor.close()
         conn.close()
 
 def get_active_knowledge_files():
-    """Mengambil daftar path file yang aktif dari database."""
     conn = get_db_connection()
     if not conn: return []
-    
     cursor = conn.cursor(dictionary=True)
     files = []
     try:
@@ -177,11 +157,27 @@ def get_active_knowledge_files():
         conn.close()
     return files
 
+def get_unprocessed_files_for_rag(): # Nama fungsi disesuaikan
+    """Mengambil daftar file yang belum diproses (status 'processing')."""
+    conn = get_db_connection()
+    if not conn: return []
+    cursor = conn.cursor(dictionary=True)
+    files = []
+    try:
+        cursor.execute("SELECT id, filename, filepath FROM knowledge_files WHERE status = 'processing'")
+        files = cursor.fetchall() # Mengembalikan list of dicts
+        print(f"Ditemukan {len(files)} file dengan status 'processing'.")
+    except mysql.connector.Error as err:
+        print(f"Error mengambil file yang belum diproses: {err}")
+    finally:
+        cursor.close()
+        conn.close()
+    return files
+
+
 def insert_chat_log(session_id, user_query, gpt_response, model_name="LlamaCpp_GiziAI_Streamlit"):
-    """Menyimpan log interaksi chat ke database (sesuai PDF)."""
     conn = get_db_connection()
     if not conn: return
-    
     cursor = conn.cursor()
     query = '''
         INSERT INTO chat_logs (session_id, user_query, gpt_response, model_name)
@@ -198,13 +194,17 @@ def insert_chat_log(session_id, user_query, gpt_response, model_name="LlamaCpp_G
         conn.close()
 
 def get_chat_history_from_db(session_id):
-    """Mengambil riwayat chat berdasarkan session_id dari database (sesuai PDF)."""
+    """
+    Mengambil riwayat chat berdasarkan session_id.
+    Mengembalikan list of Langchain Message objects (HumanMessage, AIMessage)
+    untuk digunakan langsung oleh MessagesPlaceholder.
+    """
     conn = get_db_connection()
     if not conn: return []
     
     cursor = conn.cursor(dictionary=True)
-    messages = []
-    # Langchain mengharapkan objek AIMessage dan HumanMessage
+    # Modifikasi: Langsung buat objek Langchain Message untuk kemudahan di RAG
+    langchain_messages = []
     from langchain_core.messages import HumanMessage, AIMessage
     try:
         cursor.execute(
@@ -213,18 +213,18 @@ def get_chat_history_from_db(session_id):
         )
         for row in cursor.fetchall():
             if row['user_query']: 
-                messages.append(HumanMessage(content=row['user_query']))
-            if row['gpt_response']:
-                messages.append(AIMessage(content=row['gpt_response']))
+                langchain_messages.append(HumanMessage(content=row['user_query']))
+            if row['gpt_response']: # Pastikan gpt_response tidak None atau string kosong jika tidak mau ditambahkan
+                langchain_messages.append(AIMessage(content=row['gpt_response']))
+        print(f"Mengambil {len(langchain_messages)} pesan dari DB untuk session {session_id}")
     except mysql.connector.Error as err:
-        print(f"Error mengambil riwayat chat: {err}")
+        print(f"Error mengambil riwayat chat dari DB: {err}")
     finally:
         cursor.close()
         conn.close()
-    return messages
+    return langchain_messages
 
-# Inisialisasi DB dan pengguna admin saat modul pertama kali diimpor
-# Ini akan dijalankan sekali ketika aplikasi Streamlit dimulai
-if __name__ != "__main__": # Hanya jalankan jika diimpor, bukan dijalankan langsung
+
+if __name__ != "__main__":
     create_tables()
     add_admin_user_if_not_exists()
